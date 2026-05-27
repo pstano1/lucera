@@ -5,6 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "contextily>=1.7.0",
     "datasets>=4.8.5",
     "earthengine-api>=1.7.26",
     "folium>=0.20.0",
