@@ -52,7 +52,8 @@ class DatasetBuilder:
         strategy: str = 'standard',
         threshold: float = 0.8,
         max_depth: int = 2,
-        checkpoint_dir: str = 'data/checkpoints'
+        checkpoint_dir: str = 'data/checkpoints',
+        sampling: str = 'centroid'
     ) -> 'DatasetBuilder':
         """
         Build dataset.
@@ -75,7 +76,7 @@ class DatasetBuilder:
         elif strategy == 'homogeneous':
             self._df = self._build_homogeneous(threshold)
         elif strategy == 'adaptive':
-            self._df = self._build_adaptive(threshold, max_depth, checkpoint_dir)
+            self._df = self._build_adaptive(threshold, max_depth, checkpoint_dir, sampling)
         else:
             raise ValueError(f"Unknown strategy: {strategy}")
         
@@ -137,15 +138,21 @@ class DatasetBuilder:
         
         return df
     
-    def _build_adaptive(self, threshold: float, max_depth: int, checkpoint_dir: str = 'data/checkpoints') -> 'pd.DataFrame':
+    def _build_adaptive(
+        self, 
+        threshold: float, 
+        max_depth: int, 
+        checkpoint_dir: str = 'data/checkpoints',
+        sampling: str = 'centroid'
+    ) -> 'pd.DataFrame':
+        
         if self._label_source is None:
             raise ValueError("Adaptive strategy requires set_label_source()")
         if not hasattr(self._grid, '_cells'):
             raise ValueError("Adaptive strategy requires H3GridBuilder")
         
         Path(checkpoint_dir).mkdir(parents=True, exist_ok=True)
-        
-        print(f"Building adaptive dataset (threshold={threshold}, max_depth={max_depth})...")
+        print(f"Building adaptive dataset (threshold={threshold}, max_depth={max_depth}, sampling={sampling})...")
         
         all_clean_cells = []
         cells_to_process = list(self._grid._cells)
@@ -162,10 +169,8 @@ class DatasetBuilder:
             else:
                 print(f"Depth {depth}: processing {len(cells_to_process)} cells at res {current_res}")
                 homogeneity_df = self._label_source.fetch_homogeneity(cells_to_process)
-                
                 homogeneity_df.to_csv(checkpoint_path, index=False)
                 print(f"  Checkpoint saved: {checkpoint_path}")
-                
                 clean = homogeneity_df[homogeneity_df['homogeneity'] >= threshold]
                 noisy = homogeneity_df[homogeneity_df['homogeneity'] < threshold]
             
@@ -183,15 +188,39 @@ class DatasetBuilder:
             current_res += 1
         
         all_clean = pd.concat(all_clean_cells, ignore_index=True)
-        print(f"Total clean cells after adaptive sampling: {len(all_clean)}")
+        print(f"Total clean cells: {len(all_clean)}")
         
-        points = [h3.cell_to_latlng(cell) for cell in all_clean['h3_cell']]
+        if sampling == 'centroid':
+            points = [h3.cell_to_latlng(cell) for cell in all_clean['h3_cell']]
+            labels_df = all_clean[['h3_cell', 'label', 'label_name', 'homogeneity']].copy()
+            labels_df['sample_cell'] = labels_df['h3_cell']
+            
+        elif sampling == 'children':
+            rows = []
+            for _, row in all_clean.iterrows():
+                parent_res = h3.get_resolution(row['h3_cell'])
+                children = h3.cell_to_children(row['h3_cell'], parent_res + 1)
+                for child in children:
+                    rows.append({
+                        'h3_cell': row['h3_cell'],
+                        'sample_cell': child,
+                        'label': row['label'],
+                        'label_name': row['label_name'],
+                        'homogeneity': row['homogeneity']
+                    })
+            labels_df = pd.DataFrame(rows)
+            points = [h3.cell_to_latlng(cell) for cell in labels_df['sample_cell']]
+            print(f"Expanded to {len(points)} points (7 children per clean cell)")
+        
+        else:
+            raise ValueError(f"Unknown sampling: {sampling}. Use 'centroid' or 'children'")
         
         df = pd.DataFrame(points, columns=['lat', 'lon'])
-        df['label'] = all_clean['label'].values
-        df['label_name'] = all_clean['label_name'].values
-        df['homogeneity'] = all_clean['homogeneity'].values
-        df['h3_cell'] = all_clean['h3_cell'].values
+        df['label'] = labels_df['label'].values
+        df['label_name'] = labels_df['label_name'].values
+        df['homogeneity'] = labels_df['homogeneity'].values
+        df['h3_cell'] = labels_df['h3_cell'].values
+        df['sample_cell'] = labels_df['sample_cell'].values
         
         for source in self._sources:
             source_df = source.fetch(points)
