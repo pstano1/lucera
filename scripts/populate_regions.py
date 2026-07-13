@@ -20,7 +20,9 @@ def populate(
 ):
     gdf = gpd.read_file(gadm_file, layer=gadm_level)
     print(f"Found {len(gdf)} regions at level {gadm_level}")
-    print(gdf[['NAME_1', 'NAME_2', 'HASC_2']].head(5))
+
+    available_cols = [c for c in ['NAME_1', 'NAME_2', 'HASC_2'] if c in gdf.columns]
+    print(gdf[available_cols].head(5))
     
     if dry_run:
         print("Dry run — not adding to index")
@@ -31,7 +33,11 @@ def populate(
     for _, row in gdf.iterrows():
         parent = row['NAME_1'].lower().replace(' ', '_')
         name = row[f'NAME_{gadm_level}']
-        hasc = row[f'GID_{gadm_level}'].replace('.', '_')
+        
+        gid_col = f'GID_{gadm_level}'
+        if gid_col not in row.index:
+            gid_col = 'GID_1'
+        hasc = row[gid_col].replace('.', '_')
         
         idx.add(
             region_id=hasc,

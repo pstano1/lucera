@@ -2,6 +2,7 @@ from abc import ABC, abstractmethod
 import ee
 import pandas as pd
 from tqdm import tqdm
+import time
 
 
 class EarthEngineSource(ABC):
@@ -136,11 +137,12 @@ class ESAWorldCover(EarthEngineSource):
             df = df.rename(columns={'Map': 'label'})
             df['label_name'] = df['label'].map(self.CLASS_NAMES)
         return df
+
     
     def fetch_homogeneity(
         self, 
         cells: list[str],
-        chunk_size: int = 100
+        chunk_size: int = 20
     ) -> 'pd.DataFrame':
         """
         For each H3 cell, compute majority class and homogeneity score.

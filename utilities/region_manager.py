@@ -3,6 +3,7 @@ import geopandas as gpd
 from pathlib import Path
 from datetime import datetime
 import os
+from filelock import FileLock
 
 SCHEMA = {
     'region_id': str,
@@ -36,21 +37,16 @@ class RegionConfig:
             setattr(self, col, row.get(col))
     
     def get_polygon(self):
-        import pandas as pd
-        import numpy as np
-        
         level = 2 if pd.isna(self.gadm_level) else int(self.gadm_level)
         gdf = gpd.read_file(self.gadm_file, layer=level)
-        
-        # debug — see what names exist
-        print(f"Looking for '{self.gadm_name}' in layer {level}")
-        print(f"Available names: {gdf[f'NAME_{level}'].tolist()[:5]}")
-        
-        region = gdf[gdf[f'NAME_{level}'] == self.gadm_name]
-        
+
+        gid_col = f'GID_{level}'
+        parts = self.region_id.split('_')
+        gid = parts[0] + '.' + '.'.join(parts[1:-1]) + '_' + parts[-1]
+
+        region = gdf[gdf[gid_col] == gid]
         if len(region) == 0:
-            raise ValueError(f"Region '{self.gadm_name}' not found in layer {level}")
-        
+            raise ValueError(f"{self.region_id}: GID {gid} not found in layer {level}")
         return region.union_all()
     
     def checkpoint_dir(self, storage_root: str) -> str:
@@ -86,7 +82,9 @@ class RegionIndex:
         return df
     
     def _save(self):
-        self._df.to_parquet(self.path, index=False)
+        tmp = f"{self.path}.tmp.{os.getpid()}"
+        self._df.to_parquet(tmp, index=False)
+        os.replace(tmp, self.path) 
     
     def add(
         self,
@@ -138,6 +136,7 @@ class RegionIndex:
             'slurm_job_id': None,
             'error_msg': None,
             'sampling': sampling,
+            'gadm_level': gadm_level,
         }
         self._df = pd.concat([self._df, pd.DataFrame([row])], ignore_index=True)
         self._save()
@@ -145,16 +144,17 @@ class RegionIndex:
         return self
     
     def update(self, region_id: str, **kwargs) -> 'RegionIndex':
-        mask = self._df['region_id'] == region_id
-        if not mask.any():
-            raise ValueError(f"Region {region_id} not found")
-        kwargs['updated_at'] = datetime.utcnow().isoformat()
-        for key, val in kwargs.items():
-            # store lists as strings
-            if isinstance(val, list):
-                val = str(val)
-            self._df.loc[mask, key] = val
-        self._save()
+        with FileLock(f"{self.path}.lock", timeout=120):
+            self._df = pd.read_parquet(self.path)
+            mask = self._df['region_id'] == region_id
+            if not mask.any():
+                raise ValueError(f"Region {region_id} not found")
+            kwargs['updated_at'] = datetime.utcnow().isoformat()
+            for key, val in kwargs.items():
+                if isinstance(val, list):
+                    val = str(val)
+                self._df.loc[mask, key] = val
+            self._save()
         return self
     
     def get(self, region_id: str) -> RegionConfig:

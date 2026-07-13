@@ -4,6 +4,7 @@ import pandas as pd
 import h3
 from pathlib import Path
 from tqdm import tqdm
+import time
 
 class DatasetBuilder:
     """
@@ -103,6 +104,61 @@ class DatasetBuilder:
         
         return df
     
+    def _fetch_homogeneity_safe(self, cells):
+        BATCH_SIZE = 5000
+        MIN_BATCH_SIZE = 250 
+        MAX_RETRIES = 6 
+        BACKOFF_SECONDS = 5
+    
+        RESOURCE_ERRORS = (
+            "too many concurrent aggregations",
+            "computation timed out",
+            "user memory limit exceeded",
+            "too many pixels",
+            "request payload size exceeds the limit",
+        )
+    
+        cells = list(cells)
+        n = len(cells)
+        results = []
+    
+        def _is_resource_error(exc):
+            msg = str(exc).lower()
+            return any(e in msg for e in RESOURCE_ERRORS)
+    
+        def _fetch_batch(batch, batch_size, attempt=0):
+            """Fetch one batch; on resource error, split in half and recurse."""
+            try:
+                return self._label_source.fetch_homogeneity(batch)
+            except Exception as exc:
+                if not _is_resource_error(exc):
+                    raise 
+                if attempt >= MAX_RETRIES or batch_size <= MIN_BATCH_SIZE:
+                    raise RuntimeError(
+                        f"fetch_homogeneity failed after {attempt} retries at "
+                        f"batch_size={batch_size}: {exc}"
+                    )
+                new_size = max(MIN_BATCH_SIZE, batch_size // 2)
+                wait = BACKOFF_SECONDS * (attempt + 1)
+                print(f"    EE limit hit (batch={batch_size}). "
+                    f"Halving to {new_size}, waiting {wait}s, retrying...")
+                time.sleep(wait)
+                out = []
+                for i in range(0, len(batch), new_size):
+                    sub = batch[i:i + new_size]
+                    out.append(_fetch_batch(sub, new_size, attempt + 1))
+                return pd.concat(out, ignore_index=True)
+    
+        if n <= BATCH_SIZE:
+            return self._label_source.fetch_homogeneity(cells)
+    
+        print(f"  Large region: batching {n} cells into chunks of {BATCH_SIZE}")
+        from tqdm import tqdm
+        for i in tqdm(range(0, n, BATCH_SIZE), desc="  Fetching homogeneity (batched)"):
+            batch = cells[i:i + BATCH_SIZE]
+            results.append(_fetch_batch(batch, BATCH_SIZE))
+        return pd.concat(results, ignore_index=True)
+
     def _build_homogeneous(self, threshold: float) -> 'pd.DataFrame':
         import pandas as pd
         import h3
@@ -139,62 +195,64 @@ class DatasetBuilder:
         return df
     
     def _build_adaptive(
-        self, 
-        threshold: float, 
-        max_depth: int, 
+        self,
+        threshold: float,
+        max_depth: int,
         checkpoint_dir: str = 'data/checkpoints',
         sampling: str = 'centroid'
     ) -> 'pd.DataFrame':
-        
+    
         if self._label_source is None:
             raise ValueError("Adaptive strategy requires set_label_source()")
         if not hasattr(self._grid, '_cells'):
             raise ValueError("Adaptive strategy requires H3GridBuilder")
-        
+    
         Path(checkpoint_dir).mkdir(parents=True, exist_ok=True)
-        print(f"Building adaptive dataset (threshold={threshold}, max_depth={max_depth}, sampling={sampling})...")
-        
+        print(f"Building adaptive dataset (threshold={threshold}, "
+            f"max_depth={max_depth}, sampling={sampling})...")
+    
         all_clean_cells = []
         cells_to_process = list(self._grid._cells)
         current_res = self._grid.resolution
-        
+    
         for depth in range(max_depth + 1):
             checkpoint_path = f"{checkpoint_dir}/depth_{depth}_res{current_res}.csv"
-            
+    
             if Path(checkpoint_path).exists():
                 print(f"Depth {depth}: loading from checkpoint {checkpoint_path}")
                 homogeneity_df = pd.read_csv(checkpoint_path)
                 clean = homogeneity_df[homogeneity_df['homogeneity'] >= threshold]
                 noisy = homogeneity_df[homogeneity_df['homogeneity'] < threshold]
             else:
-                print(f"Depth {depth}: processing {len(cells_to_process)} cells at res {current_res}")
-                homogeneity_df = self._label_source.fetch_homogeneity(cells_to_process)
+                print(f"Depth {depth}: processing {len(cells_to_process)} "
+                    f"cells at res {current_res}")
+                homogeneity_df = self._fetch_homogeneity_safe(cells_to_process)
                 homogeneity_df.to_csv(checkpoint_path, index=False)
                 print(f"  Checkpoint saved: {checkpoint_path}")
                 clean = homogeneity_df[homogeneity_df['homogeneity'] >= threshold]
                 noisy = homogeneity_df[homogeneity_df['homogeneity'] < threshold]
-            
+    
             print(f"  Clean: {len(clean)}, Noisy: {len(noisy)}")
             all_clean_cells.append(clean)
-            
+    
             if depth == max_depth or len(noisy) == 0:
                 break
-            
+    
             new_cells = []
             for cell in noisy['h3_cell']:
                 new_cells.extend(h3.cell_to_children(cell, current_res + 1))
-            
+    
             cells_to_process = new_cells
             current_res += 1
-        
+    
         all_clean = pd.concat(all_clean_cells, ignore_index=True)
         print(f"Total clean cells: {len(all_clean)}")
-        
+    
         if sampling == 'centroid':
             points = [h3.cell_to_latlng(cell) for cell in all_clean['h3_cell']]
             labels_df = all_clean[['h3_cell', 'label', 'label_name', 'homogeneity']].copy()
             labels_df['sample_cell'] = labels_df['h3_cell']
-            
+    
         elif sampling == 'children':
             rows = []
             for _, row in all_clean.iterrows():
@@ -211,26 +269,27 @@ class DatasetBuilder:
             labels_df = pd.DataFrame(rows)
             points = [h3.cell_to_latlng(cell) for cell in labels_df['sample_cell']]
             print(f"Expanded to {len(points)} points (7 children per clean cell)")
-        
+    
         else:
             raise ValueError(f"Unknown sampling: {sampling}. Use 'centroid' or 'children'")
-        
+    
         df = pd.DataFrame(points, columns=['lat', 'lon'])
         df['label'] = labels_df['label'].values
         df['label_name'] = labels_df['label_name'].values
         df['homogeneity'] = labels_df['homogeneity'].values
         df['h3_cell'] = labels_df['h3_cell'].values
         df['sample_cell'] = labels_df['sample_cell'].values
-        
+    
         for source in self._sources:
             source_df = source.fetch(points)
             if 'idx' in source_df.columns:
                 source_df = source_df.drop(columns=['idx'])
             df = pd.concat([df.reset_index(drop=True),
-                        source_df.reset_index(drop=True)], axis=1)
-        
-        return df
+                            source_df.reset_index(drop=True)], axis=1)
     
+        return df
+
+
     def _fetch_kronecker_homogeneity(self, threshold: float):
         """For Kronecker points - check homogeneity using 500m buffer."""
         import ee
