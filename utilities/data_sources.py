@@ -167,8 +167,8 @@ class ESAWorldCover(EarthEngineSource):
                 counts = image.reduceRegion(
                     reducer=ee.Reducer.frequencyHistogram(),
                     geometry=polygon,
-                    scale=10,
-                    maxPixels=1e6
+                    scale=100,
+                    maxPixels=1e9
                 )
                 
                 features.append(

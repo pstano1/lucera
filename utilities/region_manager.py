@@ -29,20 +29,27 @@ SCHEMA = {
     'sampling': str
 }
 
+def name_col(level: int) -> str:
+    """GADM stores the level-0 name in 'COUNTRY'; levels 1+ use 'NAME_{level}'."""
+    return 'COUNTRY' if level == 0 else f'NAME_{level}'
+
 class RegionConfig:
     """Single region configuration."""
     
     def __init__(self, row: pd.Series):
         for col in SCHEMA:
             setattr(self, col, row.get(col))
-    
+
     def get_polygon(self):
         level = 2 if pd.isna(self.gadm_level) else int(self.gadm_level)
         gdf = gpd.read_file(self.gadm_file, layer=level)
-
         gid_col = f'GID_{level}'
-        parts = self.region_id.split('_')
-        gid = parts[0] + '.' + '.'.join(parts[1:-1]) + '_' + parts[-1]
+
+        if level == 0:
+            gid = self.region_id
+        else:
+            parts = self.region_id.split('_')
+            gid = parts[0] + '.' + '.'.join(parts[1:-1]) + '_' + parts[-1]
 
         region = gdf[gdf[gid_col] == gid]
         if len(region) == 0:

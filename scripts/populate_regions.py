@@ -4,7 +4,7 @@ sys.path.append(str(Path(__file__).parent.parent))
 
 import argparse
 import geopandas as gpd
-from utilities.region_manager import RegionIndex
+from utilities.region_manager import RegionIndex, name_col
 
 def populate(
     gadm_file: str,
@@ -31,12 +31,13 @@ def populate(
     idx = RegionIndex()
     
     for _, row in gdf.iterrows():
-        parent = row['NAME_1'].lower().replace(' ', '_')
-        name = row[f'NAME_{gadm_level}']
-        
+        name = row[name_col(gadm_level)]
+        parent_level = max(gadm_level - 1, 0)
+        parent = row[name_col(parent_level)].lower().replace(' ', '_')
+
         gid_col = f'GID_{gadm_level}'
         if gid_col not in row.index:
-            gid_col = 'GID_1'
+            raise KeyError(f"{gid_col} not found for level {gadm_level}; columns: {row.index.tolist()}")
         hasc = row[gid_col].replace('.', '_')
         
         idx.add(
